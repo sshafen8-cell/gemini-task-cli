@@ -1,0 +1,4 @@
+/gemini-task
+/.build/
+/.swiftpm/
+.DS_Store
