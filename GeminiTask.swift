@@ -6,6 +6,14 @@ import SQLite3
 
 private let geminiBundle = "com.google.GeminiMacOS"
 private let geminiPath = "/Applications/Gemini.app"
+// Foreground events require an explicit per-invocation opt-in, never an omitted --worker.
+private var interactiveUIAllowed = false
+
+private func requireInteractiveUI() throws {
+    guard interactiveUIAllowed else {
+        throw BridgeError("interactive_required", "This operation can activate Gemini. Background mode did not send a foreground event. Use --interactive only when the user explicitly permits foreground interaction.")
+    }
+}
 
 // Process ownership and UI coordination must not depend on a harness's archive path.
 private let runtimeDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -271,10 +279,15 @@ struct Gemini {
     let accessibility: AXUIElement
     let noNavigation: Bool
     let worker: WorkerProcess?
+    let readOnly: Bool
 
-    init(noNavigation: Bool = false, worker: WorkerProcess? = nil) throws {
-        self.noNavigation = noNavigation || worker != nil
+    init(noNavigation: Bool = false, worker: WorkerProcess? = nil, readOnly: Bool = false) throws {
+        self.noNavigation = noNavigation || worker != nil || readOnly
         self.worker = worker
+        self.readOnly = readOnly
+        guard worker != nil || readOnly || interactiveUIAllowed else {
+            throw BridgeError("interactive_required", "Background mode requires a verified CLI worker. The existing foreground App was left unchanged.")
+        }
         guard AXIsProcessTrusted() else {
             throw BridgeError("accessibility_required", "Allow the command runner in macOS Privacy & Security > Accessibility, then retry.")
         }
@@ -289,7 +302,7 @@ struct Gemini {
             return
         }
         if NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).isEmpty {
-            guard !noNavigation else {
+            guard !self.noNavigation else {
                 throw BridgeError("would_navigate", "Open the intended Gemini Task before using no-navigation mode.")
             }
             try Self.deliver("googlegemini://newchat")
@@ -305,6 +318,7 @@ struct Gemini {
     }
 
     static func deliver(_ argument: String) throws {
+        try requireInteractiveUI()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         process.arguments = ["-b", geminiBundle, argument]
@@ -363,6 +377,7 @@ struct Gemini {
     }
 
     func key(_ code: CGKeyCode, _ flags: CGEventFlags = []) throws {
+        try requireInteractiveUI()
         guard worker == nil else {
             throw BridgeError("worker_keyboard_unavailable", "The independent worker keeps its controls off the foreground keyboard.")
         }
@@ -389,6 +404,7 @@ struct Gemini {
     }
 
     func paste(_ text: String, into target: Node) throws {
+        try requireInteractiveUI()
         _ = AXUIElementSetAttributeValue(target.ref, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         let clipboard = ClipboardCapture()
         clipboard.board.clearContents()
@@ -423,6 +439,7 @@ struct Gemini {
     }
 
     func freshTask() throws {
+        try requireInteractiveUI()
         try checkAvailable()
         try Self.deliver("googlegemini://newchat")
         let toggle = try waitNode("Task mode toggle") { $0.id == "chat-input-mode-assign" }
@@ -525,6 +542,7 @@ struct Gemini {
     }
 
     func connect(_ directory: URL, allowNew: Bool) throws {
+        try requireInteractiveUI()
         try Self.deliver(directory.path)
         guard let attached = try poll(12, {
             if let text = approval() {
@@ -555,6 +573,7 @@ struct Gemini {
     }
 
     func modelMenu() throws -> [Node] {
+        try requireInteractiveUI()
         let selector = try waitNode("model selector") { $0.id == "tab_stop_model_selector" }
         try selector.press()
         guard let choices = try poll(5, {
@@ -601,6 +620,7 @@ struct Gemini {
     }
 
     func attach(_ file: URL) throws {
+        try requireInteractiveUI()
         let name = file.lastPathComponent
         func attachmentCount() -> Int {
             nodes().filter {
@@ -617,6 +637,7 @@ struct Gemini {
     }
 
     func fill(_ text: String) throws -> Node {
+        guard !readOnly else { throw BridgeError("read_only", "This legacy job is being observed without changing the App.") }
         guard let draft = composer() else { throw BridgeError("composer_unavailable", "Gemini's task editor is unavailable.") }
         guard draft.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw BridgeError("unsent_draft", "Gemini contains an unsent draft.")
@@ -650,6 +671,7 @@ struct Gemini {
     }
 
     func answer(_ marker: String) throws -> String {
+        guard !readOnly else { throw BridgeError("read_only", "Read the saved answer with history-read instead of changing the App.") }
         guard let copy = copyAnswerButton(marker) else {
             throw BridgeError("answer_unavailable", "Gemini did not expose a Copy answer control for this delivered prompt.")
         }
@@ -729,6 +751,7 @@ struct Gemini {
     }
 
     func stop() throws {
+        guard !readOnly else { throw BridgeError("read_only", "Read-only observation cannot cancel a legacy foreground job.") }
         try waitNode("Stop task", 4) { $0.id == "stop_button" }.press()
     }
 }
@@ -1018,6 +1041,24 @@ struct Job: Codable {
 
     var isTerminal: Bool {
         ["completed", "missing_output", "failed", "cancelled"].contains(state)
+    }
+
+    var archivedAnswer: String? {
+        var matched = false
+        var answer: String?
+        for message in transcript?.messages ?? [] {
+            if message.role == "user" {
+                if message.text.hasPrefix("[\(marker)]") {
+                    matched = true
+                    answer = nil
+                } else if matched {
+                    break
+                }
+            } else if matched && message.role == "assistant" {
+                answer = message.text
+            }
+        }
+        return answer
     }
 
     var response: [String: Any] {
@@ -1350,7 +1391,7 @@ struct Options {
 
     init(_ args: [String]) throws {
         let named = Set(["--cwd", "--prompt", "--prompt-file", "--model", "--attach", "--result", "--timeout", "--query", "--limit"])
-        let booleans = Set(["--allow-new-folder", "--json", "--no-navigation", "--worker"])
+        let booleans = Set(["--allow-new-folder", "--json", "--no-navigation", "--worker", "--interactive"])
         var index = 0
         while index < args.count {
             let key = args[index]
@@ -1376,7 +1417,7 @@ struct Options {
 
     func validate(keys: [String], flags allowedFlags: [String] = [], positions: Int = 0) throws {
         guard Set(arguments.keys).isSubset(of: Set(keys)),
-              flags.isSubset(of: Set(allowedFlags + ["--json", "--no-navigation", "--worker"])),
+              flags.isSubset(of: Set(allowedFlags + ["--json", "--no-navigation", "--worker", "--interactive"])),
               positionals.count == positions else {
             throw BridgeError("usage", "Unexpected options or arguments for this command. See gemini-task help.")
         }
@@ -1485,7 +1526,7 @@ func submit(_ job: inout Job, app: Gemini, store: Store, prompt: String, expecte
     try store.save(job)
 }
 
-func newJob(_ options: Options, store: Store, useWorker: Bool = false) throws -> Job {
+func newJob(_ options: Options, store: Store, useWorker: Bool = true) throws -> Job {
     if useWorker && options.arguments["--attach"] != nil {
         throw BridgeError("worker_attachments_unavailable", "This mode uses the authorized original directory. Attachments are unavailable in the isolated worker.")
     }
@@ -1568,6 +1609,7 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
             // Recover a crash between persisting the terminal job and releasing its shared slot.
             if job.worker != nil { try store.save(job) }
             let canRefreshID = job.conversationID == nil &&
+                (job.worker != nil || interactiveUIAllowed) &&
                 ["completed", "missing_output"].contains(job.state) &&
                 AXIsProcessTrusted() &&
                 !NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).isEmpty
@@ -1585,9 +1627,11 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
         let app: Gemini
         if job.worker != nil {
             if job.worker?.application == nil {
-                job.worker = try store.worker(reuseOrLaunch: true)
+                job.worker = try store.worker(reuseOrLaunch: !noNavigation)
             }
             app = try Gemini(noNavigation: true, worker: job.worker)
+        } else if !interactiveUIAllowed {
+            app = try Gemini(noNavigation: true, readOnly: true)
         } else if noNavigation {
             app = try Gemini(noNavigation: true)
         } else {
@@ -1601,7 +1645,7 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
             return job
         }
         if !app.showsConversation(job.marker, nativeID: job.conversationID) {
-            if noNavigation {
+            if noNavigation || app.readOnly {
                 job.progress = "The selected Task differs from this job; no-navigation mode left the window unchanged."
                 return job
             }
@@ -1670,6 +1714,9 @@ func follow(_ id: String, _ options: Options, store: Store, noNavigation: Bool, 
         guard !requireWorker || job.worker != nil else {
             throw BridgeError("not_worker_job", "This job was not dispatched to an isolated worker.")
         }
+        if job.worker == nil && !interactiveUIAllowed {
+            throw BridgeError("interactive_required", "This job was created in foreground mode. Background mode will not submit to it. Use a verified worker/native Task, or --interactive only with explicit user permission.")
+        }
         if job.worker != nil && options.arguments["--attach"] != nil {
             throw BridgeError("worker_attachments_unavailable", "Attachments are unavailable in the isolated worker.")
         }
@@ -1678,13 +1725,16 @@ func follow(_ id: String, _ options: Options, store: Store, noNavigation: Bool, 
         let expected = try options.expected(in: directory)
         let attachments = try options.attachments(in: directory)
         if job.worker != nil {
-            job.worker = try store.worker(reuseOrLaunch: true)
+            job.worker = try store.worker(reuseOrLaunch: !noNavigation)
         }
         let app = try Gemini(noNavigation: noNavigation, worker: job.worker)
         try store.requireAccount(app)
         if job.worker != nil { try store.requireIdleWorker(app) } else { try app.checkAvailable() }
         var reopened: NativeTask?
         if job.worker != nil, !app.showsConversation(job.marker, nativeID: job.conversationID) {
+            guard !noNavigation else {
+                throw BridgeError("would_navigate", "The requested job is not the selected Task. No-navigation mode did not open it.")
+            }
             let task = try app.reopenWorkerJob(job, store: store)
             guard app.hasFolder(directory) else {
                 throw BridgeError("folder_not_connected", "The reopened Task did not expose its previously connected project folder.")
@@ -1756,7 +1806,7 @@ let usage = """
 gemini-task — control the installed Gemini Mac app
 
   doctor
-  models
+  models --interactive
   start [--worker] --cwd DIR (--prompt TEXT | --prompt-file FILE|-) [--model NAME]
         [--attach FILE ...] [--result FILE ...] [--allow-new-folder]
   run   [start options] [--timeout SECONDS]
@@ -1777,10 +1827,14 @@ gemini-task — control the installed Gemini Mac app
   worker-stop
 
 Commands emit JSON. Relative attachment/output paths are relative to --cwd.
+App operations default to the shared hidden worker; --worker is an optional alias.
+--interactive explicitly permits foreground interaction. It is required for the
+native model menu, attachments, and first folder authorization. Do not add it
+unless the user permits foreground interaction; it conflicts with --worker.
 --no-navigation (or GEMINI_TASK_NO_NAVIGATION=1) permits read commands and
 follow-up to the already-selected Task. It rejects commands that open another page.
---worker (or GEMINI_TASK_BACKGROUND_WORKER=1) shares one hidden, CLI-managed
-Gemini App across all harnesses, including different archive directories.
+Background mode shares one hidden, CLI-managed Gemini App across all harnesses,
+including different archive directories.
 It never launches a second instance or takes over an unregistered main App.
 tasks and read always use the worker. tasks lists verified Tasks from the
 current native search, and read returns the conversation text loaded by Gemini.
@@ -1792,15 +1846,30 @@ func main() throws -> Int32 {
     guard let command = CommandLine.arguments.dropFirst().first,
           !["--help", "-h", "help"].contains(command) else { print(usage); return 0 }
     let options = try Options(Array(CommandLine.arguments.dropFirst(2)))
-    let useWorker = ["tasks", "read"].contains(command) || options.flags.contains("--worker") ||
+    let explicitWorker = options.flags.contains("--worker") ||
         ProcessInfo.processInfo.environment["GEMINI_TASK_BACKGROUND_WORKER"] == "1"
-    if useWorker && !["doctor", "start", "run", "status", "wait", "history", "history-read", "open", "tasks", "read", "answer", "follow-up", "worker-stop"].contains(command) {
-        throw BridgeError("unsupported_worker_command", "This command is unavailable in the isolated worker.")
+    interactiveUIAllowed = options.flags.contains("--interactive")
+    if interactiveUIAllowed && (explicitWorker || options.flags.contains("--no-navigation") ||
+        ProcessInfo.processInfo.environment["GEMINI_TASK_NO_NAVIGATION"] == "1") {
+        throw BridgeError("usage", "--interactive conflicts with --worker, background-worker environment settings, and --no-navigation.")
+    }
+    let useWorker = !interactiveUIAllowed
+    if interactiveUIAllowed && ["tasks", "read"].contains(command) {
+        throw BridgeError("usage", "Native history commands use the background worker; omit --interactive.")
+    }
+    if useWorker && command == "models" {
+        throw BridgeError("interactive_required", "Listing the native model menu can activate Gemini. No App was opened. Background tasks can use --model NAME; list the menu with --interactive only when foreground interaction is explicitly permitted.")
+    }
+    if useWorker && (options.arguments["--attach"] != nil || options.flags.contains("--allow-new-folder")) {
+        throw BridgeError("interactive_required", "Native file upload and first folder authorization can activate Gemini. No App was opened and no prompt was submitted. Use an already-authorized original folder, or --interactive only with explicit user permission.")
     }
     let noNavigation = options.flags.contains("--no-navigation") ||
         ProcessInfo.processInfo.environment["GEMINI_TASK_NO_NAVIGATION"] == "1"
-    if noNavigation && !useWorker && !["doctor", "status", "wait", "history", "history-read", "answer", "follow-up", "worker-stop"].contains(command) {
+    if noNavigation && !["doctor", "status", "wait", "history", "history-read", "answer", "follow-up", "worker-stop"].contains(command) {
         throw BridgeError("would_navigate", "This command can change the Gemini page. No-navigation mode did not call Gemini.")
+    }
+    if noNavigation && command == "follow-up" && options.positionals.first.map(Gemini.isNativeID) == true {
+        throw BridgeError("would_navigate", "Following a native ID can search and open another Task. Use an already-selected CLI job with no-navigation mode.")
     }
     if command == "doctor" {
         try options.validate(keys: [])
@@ -1814,6 +1883,9 @@ func main() throws -> Int32 {
             "desktop_running": !instances.isEmpty,
             "app_process_count": instances.count,
             "worker_policy": "single_app",
+            "default_mode": "background",
+            "foreground_requires_flag": "--interactive",
+            "binary_path": CommandLine.arguments[0],
             "worker_pid": worker?.pid as Any,
             "worker_hidden": worker?.application?.isHidden as Any,
             "shared_runtime_directory": runtimeDirectory.path,
@@ -1852,10 +1924,10 @@ func main() throws -> Int32 {
         try options.validate(keys: command == "wait" ? ["--timeout"] : [], positions: 1)
         let id = options.positionals[0]
         let saved = try store.load(id)
-        guard !useWorker || saved.worker != nil else {
+        guard !explicitWorker || saved.worker != nil else {
             throw BridgeError("not_worker_job", "This job was not dispatched to an isolated worker.")
         }
-        let job = command == "status" ? try status(id, store: store, noNavigation: noNavigation, requireWorker: useWorker) :
+        let job = command == "status" ? try status(id, store: store, noNavigation: noNavigation, requireWorker: explicitWorker) :
             try waitForJob(saved, timeout: options.timeout(), store: store, noNavigation: noNavigation)
         let result = finish(job)
         return command == "wait" && !job.isTerminal && result == 0 ? 3 : result
@@ -1953,10 +2025,18 @@ func main() throws -> Int32 {
         let id = options.positionals[0]
         if useWorker {
             let response = try store.locked { () throws -> [String: Any] in
+                let saved = Gemini.isNativeID(id) ? nil : try store.load(id)
+                if let saved, saved.worker == nil && saved.nativeConversationID == nil {
+                    throw BridgeError("interactive_required", "This legacy foreground job has no verified native Task identity. Background open left the App unchanged.")
+                }
                 let worker = try store.worker(reuseOrLaunch: true)
                 let app = try Gemini(worker: worker)
                 try store.requireIdleWorker(app)
-                let task = try app.workerTask(id, query: options["--query"], store: store)
+                let task = if let saved {
+                    try app.reopenWorkerJob(saved, query: options["--query"], store: store)
+                } else {
+                    try app.workerTask(id, query: options["--query"], store: store)
+                }
                 var result = task.response
                 result["opened"] = true
                 result["worker_pid"] = worker.pid
@@ -1991,11 +2071,18 @@ func main() throws -> Int32 {
         try options.validate(keys: [], positions: 1)
         let response = try store.locked { () throws -> [String: Any] in
             let job = try store.load(options.positionals[0])
-            guard !useWorker || job.worker != nil else {
+            guard !explicitWorker || job.worker != nil else {
                 throw BridgeError("not_worker_job", "This job was not dispatched to an isolated worker.")
             }
             guard ["completed", "missing_output"].contains(job.state) else {
                 throw BridgeError("answer_not_ready", "Wait until the native task has finished.")
+            }
+            if !interactiveUIAllowed {
+                guard let answer = job.archivedAnswer else {
+                    throw BridgeError("answer_not_archived", "No saved answer is available. Use status to observe the selected job, or read the verified native Task in the background. No window was opened.")
+                }
+                return ["job_id": job.jobID, "conversation_id": job.conversationID as Any,
+                        "answer": answer, "source": "local_archive"]
             }
             let app = try Gemini(noNavigation: noNavigation, worker: job.worker)
             try store.requireAccount(app)
@@ -2013,7 +2100,7 @@ func main() throws -> Int32 {
             return try finish(followNativeTask(options.positionals[0], options, store: store))
         }
         try options.validate(keys: ["--prompt", "--prompt-file", "--attach", "--result"], positions: 1)
-        return try finish(follow(options.positionals[0], options, store: store, noNavigation: noNavigation, requireWorker: useWorker))
+        return try finish(follow(options.positionals[0], options, store: store, noNavigation: noNavigation, requireWorker: explicitWorker))
     case "worker-stop":
         try options.validate(keys: [])
         let stopped = try store.locked {
@@ -2040,6 +2127,9 @@ func main() throws -> Int32 {
         let job = try store.locked {
             var job = try store.load(options.positionals[0])
             if job.isTerminal { return job }
+            if job.worker == nil && !interactiveUIAllowed {
+                throw BridgeError("interactive_required", "Background mode will not cancel or navigate a legacy foreground job. No App controls were pressed.")
+            }
             let app = try Gemini(worker: job.worker)
             try store.requireAccount(app)
             if job.worker != nil, !app.showsConversation(job.marker, nativeID: job.conversationID) {

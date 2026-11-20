@@ -14,3 +14,17 @@ Verified on Gemini Mac 1.147.5.1526, 2026-11-20. These are native App tests usin
 Observe foreground activation notifications and sample the foreground PID throughout App operations. In this run the foreground remained Codex. A CLI-managed instance in the foreground is rejected by the code; tests did not intentionally activate Gemini. Account switching and permission grants from Antigravity were not repeated in this run.
 
 The global coordination guarantee applies to updated CLI clients. Other software can still start extra App processes; the worker detects these and refuses to dispatch. Multiple callers share one UI slot; there is no automatic queue or parallel Task execution in one window.
+
+## Default background policy and skill installation
+
+The default mode now uses the hidden worker. Foreground operations require an explicit `--interactive`; omission of `--worker` is no longer an implicit foreground permission.
+
+```bash
+python3 tests/test_background_policy.py --bin /absolute/path/to/gemini-task
+```
+
+The black-box suite makes no submissions and never opts in to foreground mode. It checks default policy, model/attachment/folder preflight rejection, mode conflicts, strict `--no-navigation`, read-only legacy status/wait, archived answers scoped to the current prompt marker, and rejected legacy follow-up/open/cancel operations. On a signed-in Mac with an ordinary Gemini instance running, all 30 checks passed under a foreground activation monitor; the foreground remained Codex and no Gemini activation appeared.
+
+The actual failing command shape (`start --allow-new-folder --attach ...`, without `--worker`) was repeated against the updated binary previously used by the other chat. It returned `interactive_required` before submission; foreground monitoring again remained Codex. Reading the existing legacy job's status also preserved foreground state.
+
+The local installer was checked in an isolated test directory for shared binary/link targets, both skill copies, backups and preservation of unrelated files. Real installation was then verified through both command aliases and both skill paths. A fresh independent agent's system-provided Available skills list included `gemini-task-cli`; it read the skill and chose the CLI for the request to use Gemini App as a subagent without stealing focus. This verifies discovery in that fresh context, not that an already-running chat has loaded new instructions.
