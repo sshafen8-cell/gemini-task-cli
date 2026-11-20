@@ -7,6 +7,16 @@ import SQLite3
 private let geminiBundle = "com.google.GeminiMacOS"
 private let geminiPath = "/Applications/Gemini.app"
 
+// Process ownership and UI coordination must not depend on a harness's archive path.
+private let runtimeDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("gemini-task/runtime", isDirectory: true)
+private let sharedWorkerFile = runtimeDirectory.appendingPathComponent("worker-process.json")
+
+private func registeredWorker() -> WorkerProcess? {
+    guard let data = try? Data(contentsOf: sharedWorkerFile) else { return nil }
+    return try? JSONDecoder().decode(WorkerProcess.self, from: data)
+}
+
 struct AppAccount: Equatable {
     let slot: String
     let profileID: UUID
@@ -214,6 +224,7 @@ struct ClipboardCapture {
 struct WorkerProcess: Codable {
     let pid: pid_t
     let launchDate: Date
+    var managed: Bool? = nil
 
     var application: NSRunningApplication? {
         NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).first {
@@ -222,13 +233,37 @@ struct WorkerProcess: Codable {
     }
 
     func requireBackground() throws {
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier != pid else {
-            throw BridgeError("worker_in_front", "The independent Gemini worker is in the foreground. Switch away before dispatching.")
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).count <= 1 else {
+            throw BridgeError("multiple_app_instances", "More than one Gemini App process is running. Close the extra instances before using the single-app worker.")
         }
-        guard application?.isHidden == true else {
-            throw BridgeError("worker_visible", "The independent Gemini worker is not hidden. Dispatch stopped before moving any window.")
+        guard let app = application else {
+            throw BridgeError("worker_stopped", "The saved Gemini worker is no longer running.")
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier != pid else {
+            throw BridgeError("worker_in_front", "Gemini is in the foreground. Switch away and retry; the CLI will not open another App.")
+        }
+        if !app.isHidden {
+            // Only re-hide a process launched and registered by this CLI, never a user's main App.
+            let owner = registeredWorker()
+            guard owner?.pid == pid, owner?.launchDate == launchDate, owner?.managed == true else {
+                throw BridgeError("worker_visible", "Gemini is visible and is not a verified CLI-managed worker. Its windows were left unchanged.")
+            }
+            _ = app.hide()
+            guard try poll(3, {
+                // AppKit refreshes NSRunningApplication properties on its run loop.
+                RunLoop.current.run(until: Date().addingTimeInterval(0.04))
+                return app.isHidden ? true : nil
+            }) == true else {
+                throw BridgeError("worker_hide_failed", "The CLI-managed Gemini worker did not become hidden. Retry after switching away from Gemini.")
+            }
         }
     }
+}
+
+struct ActiveWorkerJob: Codable {
+    let accountID: String
+    let stateDirectory: String
+    let jobID: String
 }
 
 struct Gemini {
@@ -1053,7 +1088,10 @@ struct Store {
         let defaultPath = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("gemini-task", isDirectory: true).path
         let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["GEMINI_TASK_STATE_DIR"] ?? defaultPath, isDirectory: true)
-        try self.init(base: base, account: AppAccount.current())
+        guard let account = try poll(3, { try? AppAccount.current() }) else {
+            throw BridgeError("account_unconfirmed", "The active Gemini App account could not be identified. Wait for account loading, then retry.")
+        }
+        try self.init(base: base, account: account)
     }
 
     init(base: URL, account: AppAccount) throws {
@@ -1069,11 +1107,12 @@ struct Store {
     }
 
     func locked<T>(_ work: () throws -> T) throws -> T {
-        let fd = Darwin.open(base.appendingPathComponent("ui.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        try FileManager.default.createDirectory(at: runtimeDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let fd = Darwin.open(runtimeDirectory.appendingPathComponent("ui.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
         guard fd >= 0 else { throw BridgeError("lock_failed", "Cannot open the local command lock.") }
         defer { Darwin.close(fd) }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            throw BridgeError("bridge_busy", "Another gemini-task command is using the desktop.")
+            throw BridgeError("bridge_busy", "Another gemini-task command is using the shared Gemini worker. Retry the same operation shortly.")
         }
         defer { flock(fd, LOCK_UN) }
         try account.requireCurrent()
@@ -1095,7 +1134,8 @@ struct Store {
         return try JSONDecoder().decode(Job.self, from: Data(contentsOf: url))
     }
 
-    var workerFile: URL { root.appendingPathComponent("worker-process.json") }
+    var workerFile: URL { sharedWorkerFile }
+    var activeJobFile: URL { runtimeDirectory.appendingPathComponent("active-job.json") }
 
     func savedWorker() throws -> WorkerProcess? {
         guard FileManager.default.fileExists(atPath: workerFile.path) else { return nil }
@@ -1103,42 +1143,85 @@ struct Store {
     }
 
     func worker(reuseOrLaunch: Bool) throws -> WorkerProcess {
+        guard AXIsProcessTrusted() else {
+            throw BridgeError("accessibility_required", "Allow this command's terminal or harness in macOS Privacy & Security > Accessibility, then retry. No Gemini process was launched.")
+        }
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle)
+        guard apps.count <= 1 else {
+            throw BridgeError("multiple_app_instances", "More than one Gemini App process is running. Close the extra instances; the CLI will not create or close another App.")
+        }
         if let saved = try savedWorker(), saved.application != nil {
             try saved.requireBackground()
             try account.requireProcess(saved.pid)
             return saved
         }
-        guard reuseOrLaunch else { throw BridgeError("worker_stopped", "No independent Gemini worker is running.") }
-        let alreadyRunning = Set(NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).map(\.processIdentifier))
-        guard !alreadyRunning.isEmpty else {
-            throw BridgeError("primary_app_required", "Open your signed-in Gemini Mac app once so the CLI can create a distinct background worker.")
+        // Migrate the old per-archive worker only when its exact process identity is still valid.
+        let legacyFile = root.appendingPathComponent("worker-process.json")
+        if let data = try? Data(contentsOf: legacyFile),
+           var legacy = try? JSONDecoder().decode(WorkerProcess.self, from: data), legacy.application != nil {
+            try account.requireProcess(legacy.pid)
+            legacy.managed = true
+            try saveWorker(legacy)
+            try legacy.requireBackground()
+            return legacy
+        }
+        guard reuseOrLaunch else { throw BridgeError("worker_stopped", "No shared Gemini worker is running.") }
+        guard apps.isEmpty else {
+            throw BridgeError("single_app_in_use", "Gemini is already running outside the shared CLI worker. Quit that App when convenient, then retry: the CLI will launch one hidden instance and reuse it across harnesses. No window was changed and no second process was opened.")
         }
         let command = Process()
         command.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        command.arguments = ["-n", "-g", "-j", "-a", geminiPath]
+        command.arguments = ["-g", "-j", "-a", geminiPath]
         try command.run()
         command.waitUntilExit()
         guard command.terminationStatus == 0 else {
-            throw BridgeError("worker_launch_failed", "macOS could not launch a separate hidden Gemini instance.")
+            throw BridgeError("worker_launch_failed", "macOS could not launch the shared hidden Gemini App.")
         }
         guard let started = try poll(12, {
-            let new = NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).filter {
-                !alreadyRunning.contains($0.processIdentifier) && $0.launchDate != nil
-            }
+            let new = NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).filter { $0.launchDate != nil }
             guard new.count <= 1 else { throw BridgeError("worker_launch_ambiguous", "More than one new Gemini instance appeared.") }
             return new.first
         }), let launchDate = started.launchDate else {
             throw BridgeError("worker_launch_failed", "No new Gemini process appeared.")
         }
-        let identity = WorkerProcess(pid: started.processIdentifier, launchDate: launchDate)
-        try JSONEncoder().encode(identity).write(to: workerFile, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: workerFile.path)
+        let identity = WorkerProcess(pid: started.processIdentifier, launchDate: launchDate, managed: true)
         _ = try poll(6, { identity.application?.isHidden == true ? true : nil })
+        // Retain ownership even if startup/profile loading fails, so a retry cannot open a duplicate.
+        try saveWorker(identity)
         try identity.requireBackground()
         guard try poll(9, { try account.processUsesProfile(identity.pid) ? true : nil }) != nil else {
             throw BridgeError("account_process_mismatch", "The hidden Gemini worker did not load the active account.")
         }
         return identity
+    }
+
+    private func saveWorker(_ identity: WorkerProcess) throws {
+        try JSONEncoder().encode(identity).write(to: workerFile, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: workerFile.path)
+    }
+
+    private func activeWorkerJob() throws -> ActiveWorkerJob? {
+        guard FileManager.default.fileExists(atPath: activeJobFile.path) else { return nil }
+        return try JSONDecoder().decode(ActiveWorkerJob.self, from: Data(contentsOf: activeJobFile))
+    }
+
+    func requireIdleWorker(_ app: Gemini) throws {
+        if let active = try activeWorkerJob() {
+            guard active.accountID == account.id else {
+                throw BridgeError("worker_account_busy", "The shared worker has an unfinished job under another account. Finish or reconcile it before submitting new work.")
+            }
+            let owner = try Store(base: URL(fileURLWithPath: active.stateDirectory, isDirectory: true), account: account)
+            var job = try owner.load(active.jobID)
+            if !job.isTerminal, app.showsConversation(job.marker, nativeID: job.conversationID) {
+                update(&job, app: app)
+                try owner.save(job)
+            }
+            guard job.isTerminal else {
+                throw BridgeError("worker_busy", "The shared worker has unfinished job \(active.jobID). Use status/wait with GEMINI_TASK_STATE_DIR=\(active.stateDirectory) before submitting another task.")
+            }
+            if FileManager.default.fileExists(atPath: activeJobFile.path) { try FileManager.default.removeItem(at: activeJobFile) }
+        }
+        try app.checkAvailable()
     }
 
     func knownConversation(_ id: String) -> Job? {
@@ -1156,8 +1239,26 @@ struct Store {
     func save(_ job: Job) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let active = job.worker == nil ? nil : try activeWorkerJob()
+        let ownsActiveJob = active.map {
+            $0.accountID == account.id && $0.stateDirectory == base.path && $0.jobID == job.jobID
+        } ?? false
+        if job.worker != nil, !job.isTerminal, active != nil, !ownsActiveJob {
+            throw BridgeError("worker_busy", "Another job owns the shared worker. The new prompt was not submitted.")
+        }
         let url = try file(job.jobID)
         try encoder.encode(job).write(to: url, options: .atomic)
+        if job.worker != nil {
+            if job.isTerminal {
+                if ownsActiveJob {
+                    try FileManager.default.removeItem(at: activeJobFile)
+                }
+            } else {
+                let active = ActiveWorkerJob(accountID: account.id, stateDirectory: base.path, jobID: job.jobID)
+                try encoder.encode(active).write(to: activeJobFile, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: activeJobFile.path)
+            }
+        }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
@@ -1248,7 +1349,7 @@ struct Options {
     var positionals: [String] = []
 
     init(_ args: [String]) throws {
-        let named = Set(["--cwd", "--prompt", "--prompt-file", "--model", "--attach", "--result", "--timeout", "--query"])
+        let named = Set(["--cwd", "--prompt", "--prompt-file", "--model", "--attach", "--result", "--timeout", "--query", "--limit"])
         let booleans = Set(["--allow-new-folder", "--json", "--no-navigation", "--worker"])
         var index = 0
         while index < args.count {
@@ -1364,14 +1465,14 @@ func submit(_ job: inout Job, app: Gemini, store: Store, prompt: String, expecte
        !app.showsConversation(expectedContext.marker, nativeID: expectedContext.conversationID) {
         throw BridgeError("would_navigate", "The target Task changed before submission.")
     }
+    let button = try app.waitNode("Submit") { $0.id == "send_button" && $0.enabled }
+    if let expectedNativeTask { try app.verifyWorkerTask(expectedNativeTask) }
+    try store.requireAccount(app)
     job.state = "submission_unknown"
     job.updatedAt = Date()
     job.savedPrompts = (job.savedPrompts ?? []) + [SavedPrompt(marker: job.marker, text: prompt, recordedAt: job.updatedAt)]
     try store.save(job)
 
-    let button = try app.waitNode("Submit") { $0.id == "send_button" && $0.enabled }
-    if let expectedNativeTask { try app.verifyWorkerTask(expectedNativeTask) }
-    try store.requireAccount(app)
     try button.press()
     try app.worker?.requireBackground()
     let marker = job.marker
@@ -1396,6 +1497,7 @@ func newJob(_ options: Options, store: Store, useWorker: Bool = false) throws ->
         let worker = useWorker ? try store.worker(reuseOrLaunch: true) : nil
         let app = try Gemini(worker: worker)
         try store.requireAccount(app)
+        try store.requireIdleWorker(app)
         let jobID = UUID().uuidString.lowercased()
         let marker = "GT-" + String(jobID.replacingOccurrences(of: "-", with: "").prefix(12)).uppercased()
         var job = Job(jobID: jobID, marker: marker, cwd: directory.path, state: "preparing", artifacts: artifacts, updatedAt: Date())
@@ -1463,6 +1565,8 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
             throw BridgeError("not_worker_job", "This job was not dispatched to an isolated worker.")
         }
         if job.isTerminal {
+            // Recover a crash between persisting the terminal job and releasing its shared slot.
+            if job.worker != nil { try store.save(job) }
             let canRefreshID = job.conversationID == nil &&
                 ["completed", "missing_output"].contains(job.state) &&
                 AXIsProcessTrusted() &&
@@ -1479,9 +1583,13 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
             return job
         }
         let app: Gemini
-        if noNavigation || job.worker != nil {
-            guard let running = try? Gemini(noNavigation: true, worker: job.worker) else { return job }
-            app = running
+        if job.worker != nil {
+            if job.worker?.application == nil {
+                job.worker = try store.worker(reuseOrLaunch: true)
+            }
+            app = try Gemini(noNavigation: true, worker: job.worker)
+        } else if noNavigation {
+            app = try Gemini(noNavigation: true)
         } else {
             app = try Gemini()
         }
@@ -1493,7 +1601,10 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
             return job
         }
         if !app.showsConversation(job.marker, nativeID: job.conversationID) {
-            if noNavigation || job.worker != nil { return job }
+            if noNavigation {
+                job.progress = "The selected Task differs from this job; no-navigation mode left the window unchanged."
+                return job
+            }
             if app.approval() != nil {
                 job.progress = "A Gemini dialog is open. This job's current state could not be verified."
                 return job
@@ -1501,7 +1612,14 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
             if let draft = app.composer(), !draft.value.isEmpty { return job }
             if app.find({ $0.id == "stop_button" }) != nil { return job }
             do {
-                try app.selectConversation(job.marker, nativeID: job.conversationID)
+                if job.worker != nil {
+                    try app.checkAvailable()
+                    let task = try app.reopenWorkerJob(job, store: store)
+                    job.nativeConversationID = task.id
+                    job.conversationID = task.localID ?? job.conversationID
+                } else {
+                    try app.selectConversation(job.marker, nativeID: job.conversationID)
+                }
             } catch let error as BridgeError where ["conversation_not_visible", "conversation_not_verified"].contains(error.code) {
                 job.progress = error.message
                 return job
@@ -1559,12 +1677,12 @@ func follow(_ id: String, _ options: Options, store: Store, noNavigation: Bool, 
         let directory = localURL(job.cwd)
         let expected = try options.expected(in: directory)
         let attachments = try options.attachments(in: directory)
-        if let worker = job.worker, worker.application == nil {
+        if job.worker != nil {
             job.worker = try store.worker(reuseOrLaunch: true)
         }
         let app = try Gemini(noNavigation: noNavigation, worker: job.worker)
         try store.requireAccount(app)
-        try app.checkAvailable()
+        if job.worker != nil { try store.requireIdleWorker(app) } else { try app.checkAvailable() }
         var reopened: NativeTask?
         if job.worker != nil, !app.showsConversation(job.marker, nativeID: job.conversationID) {
             let task = try app.reopenWorkerJob(job, store: store)
@@ -1597,6 +1715,7 @@ func followNativeTask(_ id: String, _ options: Options, store: Store) throws -> 
     return try store.locked {
         let worker = try store.worker(reuseOrLaunch: true)
         let app = try Gemini(worker: worker)
+        try store.requireIdleWorker(app)
         let task = try app.workerTask(id, query: options["--query"], store: store)
         try app.checkAvailable()
         try app.verifyWorkerTask(task)
@@ -1643,7 +1762,7 @@ gemini-task — control the installed Gemini Mac app
   run   [start options] [--timeout SECONDS]
   status JOB_ID
   wait JOB_ID [--timeout SECONDS]
-  history [--query TEXT]
+  history [--query TEXT] [--limit N]
   history-read HISTORY_ID
   tasks [--query TEXT]
   read c_ID [--query TEXT]
@@ -1660,8 +1779,9 @@ gemini-task — control the installed Gemini Mac app
 Commands emit JSON. Relative attachment/output paths are relative to --cwd.
 --no-navigation (or GEMINI_TASK_NO_NAVIGATION=1) permits read commands and
 follow-up to the already-selected Task. It rejects commands that open another page.
---worker (or GEMINI_TASK_BACKGROUND_WORKER=1) uses an independent Gemini
-process and never routes the worker's UI operations to your main window.
+--worker (or GEMINI_TASK_BACKGROUND_WORKER=1) shares one hidden, CLI-managed
+Gemini App across all harnesses, including different archive directories.
+It never launches a second instance or takes over an unregistered main App.
 tasks and read always use the worker. tasks lists verified Tasks from the
 current native search, and read returns the conversation text loaded by Gemini.
 history searches the local archive. history-read reads saved text without
@@ -1685,11 +1805,19 @@ func main() throws -> Int32 {
     if command == "doctor" {
         try options.validate(keys: [])
         let app = Bundle(path: geminiPath)
+        let instances = NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle)
+        let worker = registeredWorker().flatMap { $0.application == nil ? nil : $0 }
         emit([
             "app_installed": app != nil,
             "app_version": app?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as Any,
             "accessibility_trusted": AXIsProcessTrusted(),
-            "desktop_running": !NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).isEmpty,
+            "desktop_running": !instances.isEmpty,
+            "app_process_count": instances.count,
+            "worker_policy": "single_app",
+            "worker_pid": worker?.pid as Any,
+            "worker_hidden": worker?.application?.isHidden as Any,
+            "shared_runtime_directory": runtimeDirectory.path,
+            "ui_lock_scope": "macos_user",
             "account_id": (try? AppAccount.current())?.id as Any,
             "transport": "macos_accessibility_and_local_deeplink",
             "path_transport": "launchservices_open_event"
@@ -1704,6 +1832,7 @@ func main() throws -> Int32 {
         let choices = try store.locked {
             let app = try Gemini()
             try store.requireAccount(app)
+            try store.requireIdleWorker(app)
             try app.freshTask()
             let choices = try app.modelMenu().map { ["label": $0.label, "selected": $0.selected] as [String: Any] }
             try? app.key(53)
@@ -1731,12 +1860,22 @@ func main() throws -> Int32 {
         let result = finish(job)
         return command == "wait" && !job.isTerminal && result == 0 ? 3 : result
     case "history":
-        try options.validate(keys: ["--query"])
+        try options.validate(keys: ["--query", "--limit"])
         let query = options["--query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let records = try store.history().filter { query.isEmpty || $0.matchesQuery(query) }
+        let limit: Int
+        if let value = options["--limit"] {
+            guard let number = Int(value), number > 0 else {
+                throw BridgeError("usage", "--limit takes a positive whole number.")
+            }
+            limit = number
+        } else {
+            limit = records.count
+        }
+        let listed = Array(records.prefix(limit))
         try store.account.requireCurrent()
-        emit(["scope": "local_archive", "account_id": store.account.id, "complete_account_history": false, "count": records.count,
-              "tasks": records.map(\.response)])
+        emit(["scope": "local_archive", "account_id": store.account.id, "complete_account_history": false, "count": listed.count,
+              "total_matches": records.count, "tasks": listed.map(\.response)])
         return 0
     case "history-read":
         try options.validate(keys: [], positions: 1)
@@ -1764,6 +1903,7 @@ func main() throws -> Int32 {
         let response = try store.locked { () throws -> [String: Any] in
             let worker = try store.worker(reuseOrLaunch: true)
             let app = try Gemini(worker: worker)
+            try store.requireIdleWorker(app)
             var results = try app.workerSearch(query)
             var seen = Set<String>()
             let ids = results.map { $0.0 }.filter { seen.insert($0).inserted }
@@ -1795,6 +1935,7 @@ func main() throws -> Int32 {
         let response = try store.locked { () throws -> [String: Any] in
             let worker = try store.worker(reuseOrLaunch: true)
             let app = try Gemini(worker: worker)
+            try store.requireIdleWorker(app)
             let task = try app.workerTask(options.positionals[0], query: options["--query"], store: store)
             var response = task.response
             response["messages"] = try app.loadedTranscript().map(\.response)
@@ -1814,6 +1955,7 @@ func main() throws -> Int32 {
             let response = try store.locked { () throws -> [String: Any] in
                 let worker = try store.worker(reuseOrLaunch: true)
                 let app = try Gemini(worker: worker)
+                try store.requireIdleWorker(app)
                 let task = try app.workerTask(id, query: options["--query"], store: store)
                 var result = task.response
                 result["opened"] = true
@@ -1827,7 +1969,7 @@ func main() throws -> Int32 {
         let response = try store.locked { () throws -> [String: Any] in
             let app = try Gemini()
             try store.requireAccount(app)
-            try app.checkAvailable()
+            try store.requireIdleWorker(app)
             if Gemini.isNativeID(id) {
                 if let known = store.knownConversation(id) {
                     try app.selectConversation(known.marker, nativeID: id)
@@ -1876,7 +2018,11 @@ func main() throws -> Int32 {
         try options.validate(keys: [])
         let stopped = try store.locked {
             let identity = try store.worker(reuseOrLaunch: false)
+            guard identity.managed == true else {
+                throw BridgeError("worker_not_owned", "Only a Gemini process launched by this CLI can be stopped.")
+            }
             let app = try Gemini(worker: identity)
+            try store.requireIdleWorker(app)
             guard app.find({ $0.id == "stop_button" }) == nil else {
                 throw BridgeError("worker_busy", "Wait for the active worker task before stopping the worker.")
             }
@@ -1896,7 +2042,14 @@ func main() throws -> Int32 {
             if job.isTerminal { return job }
             let app = try Gemini(worker: job.worker)
             try store.requireAccount(app)
-            try app.selectConversation(job.marker, nativeID: job.conversationID)
+            if job.worker != nil, !app.showsConversation(job.marker, nativeID: job.conversationID) {
+                try app.checkAvailable()
+                let task = try app.reopenWorkerJob(job, store: store)
+                job.nativeConversationID = task.id
+                job.conversationID = task.localID ?? job.conversationID
+            } else {
+                try app.selectConversation(job.marker, nativeID: job.conversationID)
+            }
             try app.stop()
             job.state = "cancel_requested"
             job.updatedAt = Date()
