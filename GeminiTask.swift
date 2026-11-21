@@ -20,6 +20,46 @@ private let runtimeDirectory = FileManager.default.urls(for: .applicationSupport
     .appendingPathComponent("gemini-task/runtime", isDirectory: true)
 private let sharedWorkerFile = runtimeDirectory.appendingPathComponent("worker-process.json")
 
+struct WindowProbe {
+    let error: AXError
+    let windows: [AXUIElement]
+
+    var responsive: Bool { error == .success }
+    var mainWindowPresent: Bool? {
+        guard responsive else { return nil }
+        var uncertain = false
+        for window in windows {
+            var raw: CFTypeRef?
+            let result = AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &raw)
+            guard result == .success, let title = raw as? String, !title.isEmpty else {
+                uncertain = true
+                continue
+            }
+            if title.hasPrefix("Gemini - ") { return true }
+        }
+        return uncertain ? nil : false
+    }
+    var hasMainWindow: Bool { mainWindowPresent == true }
+
+    static func read(_ pid: pid_t) -> WindowProbe {
+        let root = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(root, 0.7)
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(root, kAXWindowsAttribute as CFString, &value)
+        let windows = value as? [AXUIElement] ?? []
+        for window in windows { AXUIElementSetMessagingTimeout(window, 0.7) }
+        return WindowProbe(error: error, windows: windows)
+    }
+}
+
+private func requireResponsiveUI(_ pid: pid_t) throws -> WindowProbe {
+    let probe = WindowProbe.read(pid)
+    guard probe.responsive else {
+        throw BridgeError("app_unresponsive", "Gemini did not answer its accessibility window query (AX \(probe.error.rawValue)). This operation stopped before changing the UI. Keep any existing job ID and do not resubmit it blindly. A CLI-owned idle process can be stopped with worker-stop without first hiding or opening its window.")
+    }
+    return probe
+}
+
 private func registeredWorker() -> WorkerProcess? {
     guard let data = try? Data(contentsOf: sharedWorkerFile) else { return nil }
     return try? JSONDecoder().decode(WorkerProcess.self, from: data)
@@ -280,11 +320,14 @@ struct Gemini {
     let noNavigation: Bool
     let worker: WorkerProcess?
     let readOnly: Bool
+    let observeAllWindows: Bool
 
-    init(noNavigation: Bool = false, worker: WorkerProcess? = nil, readOnly: Bool = false) throws {
+    init(noNavigation: Bool = false, worker: WorkerProcess? = nil, readOnly: Bool = false,
+         observationPID: pid_t? = nil) throws {
         self.noNavigation = noNavigation || worker != nil || readOnly
         self.worker = worker
         self.readOnly = readOnly
+        observeAllWindows = observationPID != nil
         guard worker != nil || readOnly || interactiveUIAllowed else {
             throw BridgeError("interactive_required", "Background mode requires a verified CLI worker. The existing foreground App was left unchanged.")
         }
@@ -295,10 +338,21 @@ struct Gemini {
             guard let app = worker.application else {
                 throw BridgeError("worker_stopped", "The saved independent Gemini worker is no longer running.")
             }
+            _ = try requireResponsiveUI(worker.pid)
             try worker.requireBackground()
             running = app
             accessibility = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(accessibility, 1.8)
+            return
+        }
+        if let observationPID {
+            guard readOnly, let app = NSRunningApplication(processIdentifier: observationPID),
+                  app.bundleIdentifier == geminiBundle, !app.isTerminated else {
+                throw BridgeError("worker_stopped", "The verified Gemini process is no longer running.")
+            }
+            running = app
+            accessibility = AXUIElementCreateApplication(observationPID)
+            AXUIElementSetMessagingTimeout(accessibility, 0.7)
             return
         }
         if NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).isEmpty {
@@ -313,6 +367,7 @@ struct Gemini {
             throw BridgeError("app_unavailable", "The Gemini Mac app did not start.")
         }
         running = app
+        if readOnly { _ = try requireResponsiveUI(app.processIdentifier) }
         accessibility = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(accessibility, 1.8)
     }
@@ -336,7 +391,7 @@ struct Gemini {
         }
         let all = attr(accessibility, "AXWindows") as? [AXUIElement] ?? []
         let ordered = front.map { focused in [focused] + all.filter { !CFEqual($0, focused) } } ?? all
-        return noNavigation && worker == nil ? Array(ordered.prefix(1)) : ordered
+        return noNavigation && worker == nil && !observeAllWindows ? Array(ordered.prefix(1)) : ordered
     }
 
     func nodes(limit: Int = 580) -> [Node] {
@@ -428,6 +483,7 @@ struct Gemini {
     }
 
     func checkAvailable() throws {
+        _ = try requireResponsiveUI(running.processIdentifier)
         if let alert = approval() { throw BridgeError("needs_input", alert) }
         if find({ $0.id == "stop_button" }) != nil {
             throw BridgeError("busy", "Gemini has a response running in the current window.")
@@ -442,6 +498,12 @@ struct Gemini {
         try requireInteractiveUI()
         try checkAvailable()
         try Self.deliver("googlegemini://newchat")
+        try requireMainWindow()
+        // A deep link can leave an existing Task selected; create a new composer explicitly.
+        if find({ $0.id == "chat-input-mode-assign" }) == nil,
+           let newChat = find({ $0.id == "newChat_button" || $0.role == "AXButton" && $0.isLabel("发起新对话", "New chat") }) {
+            try newChat.press()
+        }
         let toggle = try waitNode("Task mode toggle") { $0.id == "chat-input-mode-assign" }
         if !toggle.selected { try toggle.press() }
         _ = try waitNode("Task folder button") { $0.role == "AXButton" && $0.isLabel("文件夹", "Folders", "Folder") }
@@ -450,6 +512,7 @@ struct Gemini {
 
     func prepareWorkerTask() throws {
         try worker?.requireBackground()
+        try requireMainWindow()
         try checkAvailable()
         if find({ $0.id == "chat-input-mode-assign" }) == nil {
             try waitNode("new conversation in the worker") {
@@ -466,6 +529,20 @@ struct Gemini {
         if find({ $0.role == "AXButton" && $0.isLabel("移除", "Remove") &&
             ($0.help == "移除此选择" || $0.help == "Remove this selection") }) != nil {
             throw BridgeError("worker_draft_has_selection", "The worker has a retained selection. Restart the idle worker before submitting another task.")
+        }
+    }
+
+    func requireMainWindow() throws {
+        var lastState: Bool?
+        guard try poll(5, {
+            let probe = try requireResponsiveUI(running.processIdentifier)
+            lastState = probe.mainWindowPresent
+            return probe.hasMainWindow ? true : nil
+        }) == true else {
+            if lastState == nil {
+                throw BridgeError("main_window_unconfirmed", "Gemini answered the window query but its main window could not be verified. No task was submitted or process restarted. Inspect doctor --ui; do not treat unknown window metadata as an idle App.")
+            }
+            throw BridgeError("main_window_unavailable", "Gemini is responsive but has no main conversation window. No prompt was submitted. For a CLI-owned idle instance use worker-stop and retry; do not expand a floating widget or add --interactive as a workaround.")
         }
     }
 
@@ -1192,6 +1269,7 @@ struct Store {
             throw BridgeError("multiple_app_instances", "More than one Gemini App process is running. Close the extra instances; the CLI will not create or close another App.")
         }
         if let saved = try savedWorker(), saved.application != nil {
+            _ = try requireResponsiveUI(saved.pid)
             try saved.requireBackground()
             try account.requireProcess(saved.pid)
             return saved
@@ -1233,6 +1311,16 @@ struct Store {
         guard try poll(9, { try account.processUsesProfile(identity.pid) ? true : nil }) != nil else {
             throw BridgeError("account_process_mismatch", "The hidden Gemini worker did not load the active account.")
         }
+        // A loaded account/hidden process can precede SwiftUI's first usable main window.
+        // Give only this freshly launched process a bounded readiness grace period.
+        guard try poll(12, {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.04))
+            let probe = WindowProbe.read(identity.pid)
+            return probe.responsive && probe.hasMainWindow ? true : nil
+        }) == true else {
+            _ = try requireResponsiveUI(identity.pid)
+            throw BridgeError("main_window_unavailable", "The newly launched hidden Gemini App did not expose its main window. No prompt was submitted; the owned process record was retained for recovery.")
+        }
         return identity
     }
 
@@ -1244,6 +1332,56 @@ struct Store {
     private func activeWorkerJob() throws -> ActiveWorkerJob? {
         guard FileManager.default.fileExists(atPath: activeJobFile.path) else { return nil }
         return try JSONDecoder().decode(ActiveWorkerJob.self, from: Data(contentsOf: activeJobFile))
+    }
+
+    func stopWorker() throws -> pid_t {
+        guard AXIsProcessTrusted() else {
+            throw BridgeError("accessibility_required", "Allow the actual command runner in macOS Accessibility before stopping its managed worker.")
+        }
+        guard let identity = try savedWorker(), identity.managed == true,
+              let running = identity.application else {
+            throw BridgeError("worker_not_owned", "No running process matches the shared CLI worker's PID, launch time and ownership record.")
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier != identity.pid else {
+            throw BridgeError("worker_in_front", "Gemini is in use in the foreground; worker-stop left it unchanged.")
+        }
+        try account.requireProcess(identity.pid)
+        let probe = WindowProbe.read(identity.pid)
+        if let active = try activeWorkerJob() {
+            guard active.accountID == account.id else {
+                throw BridgeError("worker_account_busy", "An unfinished job under another account owns the shared worker.")
+            }
+            let owner = try Store(base: URL(fileURLWithPath: active.stateDirectory), account: account)
+            var job = try owner.load(active.jobID)
+            if !job.isTerminal, probe.responsive {
+                let observed = try Gemini(readOnly: true, observationPID: identity.pid)
+                if observed.showsConversation(job.marker, nativeID: job.conversationID) {
+                    update(&job, app: observed)
+                    try owner.save(job)
+                }
+            }
+            guard job.isTerminal else {
+                throw BridgeError("worker_busy", "Job \(active.jobID) is unfinished. worker-stop did not terminate it, including when its UI is unresponsive.")
+            }
+            if FileManager.default.fileExists(atPath: activeJobFile.path) {
+                try FileManager.default.removeItem(at: activeJobFile)
+            }
+        }
+        if probe.responsive {
+            let observed = try Gemini(readOnly: true, observationPID: identity.pid)
+            try observed.checkAvailable()
+        }
+        // Recovery deliberately does not call requireBackground() or hide().
+        // Ask the App to quit normally; never force-terminate an unresponsive process.
+        _ = running.terminate()
+        guard try poll(8, {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            return identity.application == nil ? true : nil
+        }) == true else {
+            throw BridgeError("worker_stop_failed", "The verified CLI worker with no registered unfinished job did not finish a normal quit request. It was not force-terminated. Close it when convenient, then retry; opening or hiding its window is not required by the CLI.")
+        }
+        try FileManager.default.removeItem(at: workerFile)
+        return identity.pid
     }
 
     func requireIdleWorker(_ app: Gemini) throws {
@@ -1391,7 +1529,7 @@ struct Options {
 
     init(_ args: [String]) throws {
         let named = Set(["--cwd", "--prompt", "--prompt-file", "--model", "--attach", "--result", "--timeout", "--query", "--limit"])
-        let booleans = Set(["--allow-new-folder", "--json", "--no-navigation", "--worker", "--interactive"])
+        let booleans = Set(["--allow-new-folder", "--json", "--no-navigation", "--worker", "--interactive", "--ui"])
         var index = 0
         while index < args.count {
             let key = args[index]
@@ -1805,7 +1943,7 @@ func finish(_ job: Job) -> Int32 {
 let usage = """
 gemini-task — control the installed Gemini Mac app
 
-  doctor
+  doctor [--ui]
   models --interactive
   start [--worker] --cwd DIR (--prompt TEXT | --prompt-file FILE|-) [--model NAME]
         [--attach FILE ...] [--result FILE ...] [--allow-new-folder]
@@ -1872,11 +2010,11 @@ func main() throws -> Int32 {
         throw BridgeError("would_navigate", "Following a native ID can search and open another Task. Use an already-selected CLI job with no-navigation mode.")
     }
     if command == "doctor" {
-        try options.validate(keys: [])
+        try options.validate(keys: [], flags: ["--ui"])
         let app = Bundle(path: geminiPath)
         let instances = NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle)
         let worker = registeredWorker().flatMap { $0.application == nil ? nil : $0 }
-        emit([
+        var response: [String: Any] = [
             "app_installed": app != nil,
             "app_version": app?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as Any,
             "accessibility_trusted": AXIsProcessTrusted(),
@@ -1893,7 +2031,15 @@ func main() throws -> Int32 {
             "account_id": (try? AppAccount.current())?.id as Any,
             "transport": "macos_accessibility_and_local_deeplink",
             "path_transport": "launchservices_open_event"
-        ])
+        ]
+        if options.flags.contains("--ui"), let instance = worker?.application ?? instances.first {
+            let probe = WindowProbe.read(instance.processIdentifier)
+            response["ui"] = ["pid": instance.processIdentifier, "responsive": probe.responsive,
+                              "ax_error": probe.error.rawValue, "window_count": probe.windows.count,
+                              "main_window_present": probe.mainWindowPresent as Any,
+                              "foreground": NSWorkspace.shared.frontmostApplication?.processIdentifier == instance.processIdentifier]
+        }
+        emit(response)
         return app == nil ? 1 : 0
     }
 
@@ -2103,23 +2249,7 @@ func main() throws -> Int32 {
         return try finish(follow(options.positionals[0], options, store: store, noNavigation: noNavigation, requireWorker: explicitWorker))
     case "worker-stop":
         try options.validate(keys: [])
-        let stopped = try store.locked {
-            let identity = try store.worker(reuseOrLaunch: false)
-            guard identity.managed == true else {
-                throw BridgeError("worker_not_owned", "Only a Gemini process launched by this CLI can be stopped.")
-            }
-            let app = try Gemini(worker: identity)
-            try store.requireIdleWorker(app)
-            guard app.find({ $0.id == "stop_button" }) == nil else {
-                throw BridgeError("worker_busy", "Wait for the active worker task before stopping the worker.")
-            }
-            guard let running = identity.application, running.terminate(),
-                  try poll(8, { identity.application == nil ? true : nil }) != nil else {
-                throw BridgeError("worker_stop_failed", "Gemini did not stop the recorded worker.")
-            }
-            try FileManager.default.removeItem(at: store.workerFile)
-            return identity.pid
-        }
+        let stopped = try store.locked { try store.stopWorker() }
         emit(["status": "worker_stopped", "worker_pid": stopped])
         return 0
     case "cancel":

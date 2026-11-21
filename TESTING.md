@@ -28,3 +28,22 @@ The black-box suite makes no submissions and never opts in to foreground mode. I
 The actual failing command shape (`start --allow-new-folder --attach ...`, without `--worker`) was repeated against the updated binary previously used by the other chat. It returned `interactive_required` before submission; foreground monitoring again remained Codex. Reading the existing legacy job's status also preserved foreground state.
 
 The local installer was checked in an isolated test directory for shared binary/link targets, both skill copies, backups and preservation of unrelated files. Real installation was then verified through both command aliases and both skill paths. A fresh independent agent's system-provided Available skills list included `gemini-task-cli`; it read the skill and chose the CLI for the request to use Gemini App as a subagent without stealing focus. This verifies discovery in that fresh context, not that an already-running chat has loaded new instructions.
+
+## Unresponsive App and worker recovery (2026-11-22)
+
+An actual CLI-managed Gemini 1.147.5.1526 process was found unresponsive: the window AX query timed out (-25204), CPU use was about one core, and a one-second process sample showed its main thread in a SwiftUI/AttributeGraph accessibility/text update cycle. This is runtime evidence of the observed hang; it does not identify which prior operation triggered it.
+
+`doctor --ui` now distinguishes an AX timeout, a verified main window, and unknown window metadata without activating the App. A process being present or hidden is not a readiness check. A freshly launched process gets a bounded main-window readiness grace period before new Task controls are used. Existing unresponsive processes fail without repeated UI manipulation.
+
+`worker-stop` does not hide first. It verifies shared process ownership, PID/launch time, current account and unfinished-job records. Responsive UI checks inspect all windows for busy/draft/approval state. Without responsive UI and without a registered unfinished job it only asks the owned App to quit normally. Failure returns `worker_stop_failed`; there is no automatic force termination. Unknown window titles are not treated as proof of absence/idle, and the CLI does not automatically terminate based on them.
+
+Observed tests:
+
+- A normal quit request to the original hung process failed and left it running. Its subsequent forced termination was separately and explicitly approved by the user and performed only for that exact registered PID; it is not CLI policy.
+- After restart, a Neon Task wrote a new file in an existing authorized original directory and completed. The same Task's follow-up wrote the verified original contents plus a new line. Both used the same hidden PID.
+- After a successful normal stop, the final build cold-started a single hidden instance and completed another Neon file-writing task with correct bytes. The initial pre-grace build had failed at startup readiness; that failure was not counted as a submitted job.
+- A healthy managed instance was made visible without activation, then `worker-stop` succeeded without first hiding it. Foreground activation traces for all these operations remained Codex.
+- The 30 background-policy checks passed both with the hung process and after recovery; two isolated installer tests cover backups and idempotence.
+- Installed skill directories contain no historical backup files. Prior skill/binary backups were preserved outside discovery paths with a manifest, and current skills passed validation.
+
+These are bridge smoke tests, not the user's Phase 1 music-transcription task. They do not validate granting the home directory or foreground `--interactive` flows. The CLI still depends on native accessibility for UI operations; a future App hang is reported rather than silently treated as task completion.

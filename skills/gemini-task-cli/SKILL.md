@@ -5,6 +5,8 @@ description: 当用户要求 Gemini App（Mac 桌面版）执行任务或充当�
 
 # Gemini Task CLI
 
+只读取当前技能目录的 `SKILL.md`；不要把备份、仓库测试代码或旧探针当作操作指引。使用下述稳定 CLI 入口。
+
 用户要求 Gemini App 执行任务或充当子代理时，使用本 CLI 操作已登录的 Gemini Mac App 原生 Task；调用方可以是 Codex、反重力或其他 harness。默认走 CLI 后台，不先用电脑操作工具点击 Gemini，也不为委派任务先打开模型列表。App 使用其账号额度和已授权目录；任务应沿用用户给出的原项目目录，并明确目标、可操作范围和预期产物。
 
 ## 定位 CLI
@@ -52,6 +54,8 @@ CLI 默认后台执行；`--worker` 保留为兼容参数，不必添加。所�
 
 `single_app_in_use` 表示 Gemini 以普通方式运行且未登记为 CLI 后台实例；不要接管、隐藏或另开它。`multiple_app_instances` 表示存在多份 App；`worker_in_front` 表示 Gemini 已在前台。向用户说明具体状态，在适合的时机处理后重试。`bridge_busy` 是短暂 UI 互斥；`worker_busy` 表示未完成任务占用共享实例，按返回的 job ID 和状态目录查询或等待，不用其他目录绕过占用。后台账号不一致、目录未授权、历史搜索不可用或辅助功能未授权时，报告错误并保持后台约束。
 
+遇到 `control_unavailable`、`app_unresponsive` 或窗口异常，先运行 `doctor --ui`，区分无响应与缺主窗口。`worker-stop` 不要求实例先隐藏，仍只正常退出已核验且没有活动 job 的托管实例；退出失败报告结果，不把点开小浮窗当作已验证的修复，也不自动强杀。
+
 ## 找到目标 Task 和旧任务
 
 - 先用 `history --query '关键词' --limit 10` 和 `history-read HISTORY_ID` 读取当前账号本地档案。档案覆盖已保存或导入的记录。
@@ -60,6 +64,8 @@ CLI 默认后台执行；`--worker` 保留为兼容参数，不必添加。所�
 - 旧前台 job 的 `status`、`wait` 在默认模式下仅可只读观察当前已选会话；不会打开其他会话，不能确认时保持原状态。默认 `answer` 只读取已保存的回复；没有存档时报告 `answer_not_archived`，可查本地 history 或已核验的原生 Task。旧前台 job 的续聊和取消不能直接操作前台；续聊须使用经过核验的后台 job 或原生 Task 身份，不能猜测映射。不能安全取消时报告阻塞。
 
 ## 判断执行结果
+
+没有返回 `job_id` 的派发错误不等于任务已发出，不能宣称 Gemini 正在执行；保留错误原文再诊断。
 
 - `completed` 表示 App 报告完成且约定产物已更新；交付前检查原目录中的实际内容。
 - `submitted`、`running` 或等待超时（退出码 3）时保留 `job_id`，查询或继续等待同一单。`submission_unknown` 时先核对原提交，避免重复派发。

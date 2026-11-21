@@ -34,7 +34,7 @@ def run(argv, error=None, code=1, extra_env=None):
 
 with tempfile.TemporaryDirectory(prefix='gemini-task-policy-') as tmp:
     env['GEMINI_TASK_STATE_DIR'] = tmp
-    doctor = run(['doctor'], code=0)
+    doctor = run(['doctor', '--ui'], code=0)
     assert doctor['default_mode'] == 'background'
     assert doctor['foreground_requires_flag'] == '--interactive'
     assert doctor['worker_policy'] == 'single_app'
@@ -90,11 +90,15 @@ with tempfile.TemporaryDirectory(prefix='gemini-task-policy-') as tmp:
     assert run(['wait', completed_id, '--timeout', '1'], code=0)['status'] == 'completed'
     run(['status', '--worker', running_id], 'not_worker_job')
     if doctor['app_process_count']:
-        selected = run(['status', running_id], code=0)
-        assert selected['status'] == 'running'
-        assert 'no-navigation' in selected.get('progress', '')
-        pending = run(['wait', running_id, '--timeout', '1'], code=3)
-        assert pending['status'] == 'running'
+        if doctor.get('ui', {}).get('responsive') is False:
+            run(['status', running_id], 'app_unresponsive')
+            run(['wait', running_id, '--timeout', '1'], 'app_unresponsive')
+        else:
+            selected = run(['status', running_id], code=0)
+            assert selected['status'] == 'running'
+            assert 'no-navigation' in selected.get('progress', '')
+            pending = run(['wait', running_id, '--timeout', '1'], code=3)
+            assert pending['status'] == 'running'
     else:
         run(['status', running_id], 'would_navigate')
     after = run(['doctor'], code=0)

@@ -16,7 +16,7 @@ python3 scripts/install-local.py
 python3 scripts/install-local.py --binary /absolute/path/to/gemini-task
 ```
 
-安装器将 CLI 放在 `~/.local/share/gemini-task/bin/gemini-task`，把 `~/.local/bin/gemini-task` 和 `~/.local/bin/gemini-task-cli` 链接到它，并在 `~/.codex/skills/gemini-task-cli`、`~/.gemini/config/skills/gemini-task-cli` 安装 skill，两处的 `bin/gemini-task` 都指向同一份 CLI。被替换的目标文件会在原位置旁保留带时间戳的备份；其他文件不受影响。确保 `~/.local/bin` 在 PATH 中，或使用稳定二进制的绝对路径。
+安装器将 CLI 放在 `~/.local/share/gemini-task/bin/gemini-task`，把 `~/.local/bin/gemini-task` 和 `~/.local/bin/gemini-task-cli` 链接到它，并在 `~/.codex/skills/gemini-task-cli`、`~/.gemini/config/skills/gemini-task-cli` 安装 skill，两处的 `bin/gemini-task` 都指向同一份 CLI。被替换的文件和这两处技能目录中旧的 `SKILL.md.backup-*`、`bin/gemini-task.backup-*` 会保存在技能发现目录之外的 `~/.local/share/gemini-task/backups/<时间戳>/<原 HOME 相对路径>`；同目录的 `manifest.json` 记录原路径、备份路径及类型，符号链接保留原目标。内容相同的文件和已正确指向的链接不会重复备份，其他文件不受影响。确保 `~/.local/bin` 在 PATH 中，或使用稳定二进制的绝对路径。
 
 安装文件不代表现有活跃会话已经加载新 skill；需要该会话实际读取更新后的 `SKILL.md` 才能确认。旧二进制不会自动更新；所有 harness 都应使用稳定安装入口。也可以手动构建：
 
@@ -54,7 +54,9 @@ gemini-task run --cwd "$PWD" \
 - 未运行 Gemini 时，CLI 以隐藏方式启动；已登记的后台实例会复用。普通方式打开且未登记的 Gemini 返回 `single_app_in_use`，不会接管它或另开第二份。
 - `bridge_busy` 表示另一条命令正在短暂操作 UI，可稍后重试；`worker_busy` 表示已有未完成任务，按返回的 job ID 和档案目录查询或等待。当前没有自动队列。
 - CLI 管理的实例意外可见但不在前台时会恢复隐藏；Gemini 已在前台时返回 `worker_in_front`。外部程序额外启动多份时返回 `multiple_app_instances`。
-- `worker-stop` 只关闭经过身份和所有权核验的 CLI 实例；有未完成任务时拒绝关闭。`doctor` 返回进程数量、后台 PID 和隐藏状态。后台操作依赖 macOS 和 Gemini App 的实际行为；应通过运行时观察确认前台状态。
+- `worker-stop` 只关闭经过身份和所有权核验的 CLI 实例；有未完成任务时拒绝关闭。恢复流程不要求先隐藏窗口；界面无响应且没有已登记活动 job 时，只请求正常退出，不强制结束进程。正常退出失败返回 `worker_stop_failed`。
+- `doctor --ui` 以限时的只读查询报告 `responsive`、`ax_error`、窗口数和主窗口是否存在；`doctor` 本身仍是轻量本地检查。`app_unresponsive` 表示 App 未回答，不能当成任务已完成；`main_window_unavailable` 表示缺少主对话窗口，不能让用户盲点小浮窗。窗口元信息无法核实时，`main_window_present` 为 null，不把未知状态当作空闲，也不自动终止进程。需要恢复时先对已核验的托管实例执行 `worker-stop`，正常退出后再重试后台任务。
+- 后台操作依赖 macOS 和 Gemini App 的实际行为；应通过运行时观察确认前台状态。
 
 ## 历史档案和账号
 
