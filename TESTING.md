@@ -47,3 +47,5 @@ Observed tests:
 - Installed skill directories contain no historical backup files. Prior skill/binary backups were preserved outside discovery paths with a manifest, and current skills passed validation.
 
 These are bridge smoke tests, not the user's Phase 1 music-transcription task. They do not validate granting the home directory or foreground `--interactive` flows. The CLI still depends on native accessibility for UI operations; a future App hang is reported rather than silently treated as task completion.
+
+An extended native-read check exposed one `worker_stopped` false negative while the same PID was still live and responsive. Managed-process lookup now resolves the saved PID directly, checks the bundle and launch time, and allows one short AppKit refresh retry. Repeated native reads also exposed a transient `history_search_unconfirmed`; a subsequent exact-ID search succeeded. Reads of an already selected Task now reuse it only when its saved native-to-local mapping, displayed local ID, title and Task control all match. Otherwise the conservative search verification remains; unknown search results are not accepted as completion.

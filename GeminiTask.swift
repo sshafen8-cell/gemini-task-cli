@@ -275,9 +275,17 @@ struct WorkerProcess: Codable {
     var managed: Bool? = nil
 
     var application: NSRunningApplication? {
-        NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).first {
-            $0.processIdentifier == pid && $0.launchDate == launchDate && !$0.isTerminated
+        // Resolve the saved PID directly during native window transitions instead of depending
+        // on a fresh bundle-wide list. Still verify bundle and launch identity on every lookup.
+        func exactProcess() -> NSRunningApplication? {
+            guard let app = NSRunningApplication(processIdentifier: pid),
+                  app.bundleIdentifier == geminiBundle, app.launchDate == launchDate,
+                  !app.isTerminated else { return nil }
+            return app
         }
+        if let app = exactProcess() { return app }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.04))
+        return exactProcess()
     }
 
     func requireBackground() throws {
@@ -986,6 +994,19 @@ extension Gemini {
         guard Self.isNativeID(id) else { throw BridgeError("invalid_native_id", "Use a Gemini native ID beginning with c_.") }
         try store.requireAccount(self)
         let known = try store.nativeTask(id)
+        if let known, let localID = known.localID, conversationID() == localID,
+           title == "Gemini - " + known.title,
+           find(Self.isTaskProgressControl) != nil,
+           find({ $0.id == "gemini_search_text_field" }) == nil {
+            // An already verified native-to-local mapping identifies this page without re-searching.
+            // A title alone is insufficient; missing IDs must keep the exact-ID search path.
+            try verifyWorkerTask(known)
+            let current = NativeTask(id: known.id, localID: localID, title: known.title,
+                                     query: known.query, lastSeen: Date(),
+                                     transcript: (try? loadedTranscript()).flatMap(TranscriptSnapshot.init))
+            try store.requireAccount(self)
+            return try store.remember(current)
+        }
         if known == nil, let job = store.knownConversation(id) {
             return try reopenWorkerJob(job, query: query, store: store)
         }
