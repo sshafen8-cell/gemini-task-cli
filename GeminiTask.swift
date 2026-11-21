@@ -562,8 +562,7 @@ struct Gemini {
         guard let folder = try poll(6, {
             find { node in
                 let path = (node.value as NSString).expandingTildeInPath
-                return path.hasPrefix("/") &&
-                    URL(fileURLWithPath: path).standardizedFileURL.path == directory.path
+                return path.hasPrefix("/") && localURL(path).path == directory.path
             }
         }) else {
             if let menu = find({ $0.role == "AXMenu" }) {
@@ -1066,10 +1065,10 @@ extension Gemini {
         }
     }
 
-    func loadedTranscript() throws -> [TranscriptMessage] {
+    func messageRows(in elements: [Node]) -> [Node]? {
         // SwiftUI also exposes detached reply controls for offscreen rows.
         // Start from a reply that has a path back to the rendered transcript.
-        let container = nodes(limit: 1800).lazy.filter { $0.id == "copy-button" }.compactMap { button -> Node? in
+        let container = elements.lazy.filter { $0.id == "copy-button" }.compactMap { button -> Node? in
             var current = button.parent
             while let node = current {
                 if node.children.contains(where: { $0.role == "AXRow" }) { return node }
@@ -1077,15 +1076,40 @@ extension Gemini {
             }
             return nil
         }.first
-        guard let container else {
+        guard let container else { return nil }
+        let loadedRows = (attr(container.ref, "AXRows") as? [AXUIElement])?.map(Node.init(ref:)) ?? container.children
+        return loadedRows.filter { $0.role == "AXRow" }
+    }
+
+    func completedReply(for marker: String) -> Bool {
+        let elements = nodes(limit: 1800)
+        guard elements.count < 1800, !elements.contains(where: { $0.id == "stop_button" }),
+              let editor = composer(), editor.enabled, editor.value.isEmpty,
+              let rows = messageRows(in: elements) else { return false }
+        // Use the latest rendered user row, including unmarked messages from the App.
+        // A detached Copy control or a reply to a later prompt cannot complete this job.
+        let turns = rows.map { $0.descendants() }
+        guard let userIndex = turns.lastIndex(where: { $0.contains { $0.id.hasPrefix("userMessage.") } }),
+              turns[userIndex].contains(where: { isPrompt($0, marker: marker) }) else { return false }
+        return turns.dropFirst(userIndex + 1).contains { turn in
+            turn.contains { $0.id == "copy-button" && $0.enabled }
+                && turn.contains { $0.isLabel("Regenerate", "重新生成") }
+        }
+    }
+
+    func loadedTranscript() throws -> [TranscriptMessage] {
+        guard let rows = messageRows(in: nodes(limit: 1800)) else {
             throw BridgeError("transcript_unavailable", "Gemini did not expose the loaded message rows.")
         }
-        let loadedRows = (attr(container.ref, "AXRows") as? [AXUIElement])?.map(Node.init(ref:)) ?? container.children
-        return loadedRows.filter { $0.role == "AXRow" }.compactMap { row in
+        return rows.compactMap { row in
             let all = row.descendants()
             if let copy = all.first(where: { $0.id == "copy-button" }) {
                 // The reply text shares a group with the toolbar. Expanded plan steps are nested separately.
                 let reply = copy.parent?.parent?.children.filter { $0.role == "AXStaticText" } ?? []
+                // A response containing a code block can be rendered as one accessible
+                // widget with the full Markdown in its description and no static text.
+                let widget = all.first { $0.id.hasPrefix("code-widget-") && !$0.description.isEmpty }
+                if reply.isEmpty, let widget { return TranscriptMessage(role: "assistant", text: widget.description) }
                 let body = (reply.isEmpty ? all.filter { $0.role == "AXStaticText" } : reply)
                     .map { $0.value.isEmpty ? $0.label : $0.value }
                     .filter { !$0.isEmpty }.joined(separator: "\n")
@@ -1169,6 +1193,7 @@ struct Job: Codable {
             "worker_pid": worker?.pid as Any,
             "cwd": cwd,
             "status": state,
+            "execution_state": state == "missing_output" ? "completed" : state,
             "progress": progress as Any,
             "artifacts": artifacts.map { ["path": $0.path, "updated": $0.updated] },
             "updated_at": ISO8601DateFormatter().string(from: updatedAt)
@@ -1736,6 +1761,10 @@ func update(_ job: inout Job, app: Gemini) {
     if job.state == "cancel_requested", app.restoredDraft(job.marker) {
         job.state = "cancelled"
         job.progress = "Gemini stopped and restored this job's prompt as an unsent draft."
+    } else if state.state == "status_unconfirmed", app.completedReply(for: job.marker) {
+        // The Task plan may stay on "Starting" after the final reply is available.
+        job.state = job.artifacts.allSatisfy(\.updated) ? "completed" : "missing_output"
+        job.progress = "Gemini finalized this reply."
     } else if state.state == "completed" {
         let hasArtifacts = !job.artifacts.isEmpty && job.artifacts.allSatisfy(\.updated)
         if hasArtifacts || app.copyAnswerButton(job.marker) != nil {

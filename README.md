@@ -47,6 +47,10 @@ gemini-task run --cwd "$PWD" \
 
 `completed` 表示 App 报告完成且约定产物已更新，交付前仍应检查实际内容。等待超时返回退出码 3，可继续查询同一 job。出现 `submission_unknown` 时先核对已返回的 job ID，避免重复提交。
 
+有时 App 已生成最终回复，计划面板仍停在「正在启动」。CLI 也会核对该轮提示和最终回复控件。执行结束后如果指定文件未更新，`wait` 以退出码 1 返回 `execution_state: completed`、`status: missing_output`。用 `answer JOB_ID` 查看该轮存档的回复。
+
+Gemini 连接某个目录后，Task 内部仍可能拒绝访问其中的特定路径。反重力内部 `~/.gemini/antigravity/scratch` 曾出现这种失败。两个 harness 应使用同一个普通项目目录，并以它为 `--cwd`；正式派发前用小文件验证该目录实际可读写。
+
 ## 单 App 调度
 
 所有后台调用共享当前 macOS 用户的一份 CLI 管理的 Gemini App。进程记录、UI 锁和活动任务记录位于固定的 `~/Library/Application Support/gemini-task/runtime`，不随 `GEMINI_TASK_STATE_DIR` 改变。不同档案目录仍共用同一个后台 PID。

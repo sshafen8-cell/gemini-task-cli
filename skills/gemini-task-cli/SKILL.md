@@ -52,6 +52,8 @@ CLI 默认后台执行；`--worker` 保留为兼容参数，不必添加。所�
 
 后台只能使用 App 已授权的目录。`models`、`--attach` 和首次授权的 `--allow-new-folder` 需要前台；默认模式会返回 `interactive_required`。**不得自行追加 `--interactive`，也不得切换为电脑操作工具绕过此限制。**只有用户明确允许 Gemini 前台交互后，才可对具体命令使用 `--interactive`；否则报告阻塞及原因。`--interactive` 与 `--worker`、后台环境设置及 `--no-navigation` 冲突。
 
+连接目录并不证明 Task 运行环境能读写其中的每个路径。若 Gemini 回复无法访问反重力内部的 `~/.gemini/antigravity/scratch`，向调用方返回具体路径和原回复。让两个 harness 使用同一个普通项目目录，优先从该目录启动项目，已有项目的迁移需保留输入与产物并更新路径引用。以项目目录为 `--cwd`，先做小规模读写确认；扩大到主目录或给内部目录套软链接不能作为权限验证。
+
 `single_app_in_use` 表示 Gemini 以普通方式运行且未登记为 CLI 后台实例；不要接管、隐藏或另开它。`multiple_app_instances` 表示存在多份 App；`worker_in_front` 表示 Gemini 已在前台。向用户说明具体状态，在适合的时机处理后重试。`bridge_busy` 是短暂 UI 互斥；`worker_busy` 表示未完成任务占用共享实例，按返回的 job ID 和状态目录查询或等待，不用其他目录绕过占用。后台账号不一致、目录未授权、历史搜索不可用或辅助功能未授权时，报告错误并保持后台约束。
 
 遇到 `control_unavailable`、`app_unresponsive` 或窗口异常，先运行 `doctor --ui`，区分无响应与缺主窗口。`worker-stop` 不要求实例先隐藏，仍只正常退出已核验且没有活动 job 的托管实例；退出失败报告结果，不把点开小浮窗当作已验证的修复，也不自动强杀。
@@ -69,4 +71,4 @@ CLI 默认后台执行；`--worker` 保留为兼容参数，不必添加。所�
 
 - `completed` 表示 App 报告完成且约定产物已更新；交付前检查原目录中的实际内容。
 - `submitted`、`running` 或等待超时（退出码 3）时保留 `job_id`，查询或继续等待同一单。`submission_unknown` 时先核对原提交，避免重复派发。
-- `needs_input` 表示 App 等待处理；`missing_output` 表示 App 已结束但约定文件未通过核验。说明具体状态和现有产物。
+- `needs_input` 表示 App 等待处理。`execution_state: completed` 和 `status: missing_output` 表示 App 已结束，但约定文件未通过核验。`wait` 返回退出码 1，此时应读 `answer JOB_ID` 或 `history-read JOB_ID` 诊断具体阻塞，结束对该次执行的等待。
