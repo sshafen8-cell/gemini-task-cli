@@ -95,12 +95,13 @@ with tempfile.TemporaryDirectory(prefix='gemini-task-policy-') as tmp:
             run(['wait', running_id, '--timeout', '1'], 'app_unresponsive')
         else:
             selected = run(['status', running_id], code=0)
-            assert selected['status'] == 'running'
+            assert selected['status'] == 'status_unconfirmed'
             assert 'no-navigation' in selected.get('progress', '')
             pending = run(['wait', running_id, '--timeout', '1'], code=3)
-            assert pending['status'] == 'running'
+            assert pending['status'] == 'status_unconfirmed'
     else:
-        run(['status', running_id], 'would_navigate')
+        run(['status', running_id], 'app_not_observable')
+        assert run(['wait', running_id, '--timeout', '1'], code=3)['status'] == 'status_unconfirmed'
     after = run(['doctor'], code=0)
     assert after['app_process_count'] == doctor['app_process_count'], 'App count changed during non-mutating checks'
 print(json.dumps({'passed': passed, 'default_mode': 'background', 'submitted_prompts': 0}))

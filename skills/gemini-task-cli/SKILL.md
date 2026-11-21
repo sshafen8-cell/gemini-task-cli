@@ -71,4 +71,5 @@ CLI 默认后台执行；`--worker` 保留为兼容参数，不必添加。所�
 
 - `completed` 表示 App 报告完成且约定产物已更新；交付前检查原目录中的实际内容。
 - `submitted`、`running` 或等待超时（退出码 3）时保留 `job_id`，查询或继续等待同一单。`submission_unknown` 时先核对原提交，避免重复派发。
+- `app_not_observable` 或 `status_unconfirmed` 表示监控暂时无法验证当前任务。保留原 job ID，先用 `doctor --ui` 核对 App，再查询该任务；监控失败不能作为重新提交的依据。
 - `needs_input` 表示 App 等待处理。`execution_state: completed` 和 `status: missing_output` 表示 App 已结束，但约定文件未通过核验。`wait` 返回退出码 1，此时应读 `answer JOB_ID` 或 `history-read JOB_ID` 诊断具体阻塞，结束对该次执行的等待。

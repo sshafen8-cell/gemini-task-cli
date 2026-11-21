@@ -45,6 +45,8 @@ gemini-task run --cwd "$PWD" \
 
 旧前台 job 的 `status` 和 `wait` 默认只读观察当前已选会话，不切换窗口；无法确认时保留原状态。默认 `answer` 读取本地存档，缺少已保存回复则返回 `answer_not_archived`。续聊需使用已验证的后台 job 或原生 Task；默认模式不会直接续聊或取消旧前台 job。
 
+只读观察会在短暂的进程发现失败时重试，仍核验账号和选中的会话。`status` 找不到 App 时返回 `app_not_observable`，`wait` 在连续无法观察时带原 job ID 返回 `status_unconfirmed` 和退出码 3。本地保存的任务状态可继续查询。
+
 `completed` 表示 App 报告完成且约定产物已更新，交付前仍应检查实际内容。等待超时返回退出码 3，可继续查询同一 job。出现 `submission_unknown` 时先核对已返回的 job ID，避免重复提交。
 
 有时 App 已生成最终回复，计划面板仍停在「正在启动」。CLI 也会核对该轮提示和最终回复控件。执行结束后如果指定文件未更新，`wait` 以退出码 1 返回 `execution_state: completed`、`status: missing_output`。用 `answer JOB_ID` 查看该轮存档的回复。

@@ -363,20 +363,44 @@ struct Gemini {
             AXUIElementSetMessagingTimeout(accessibility, 0.7)
             return
         }
-        if NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).isEmpty {
-            guard !self.noNavigation else {
-                throw BridgeError("would_navigate", "Open the intended Gemini Task before using no-navigation mode.")
+        if readOnly {
+            // Interactive jobs have no worker binding. Use the registered process as a
+            // discovery fallback, then let status verify the selected Task and account.
+            let saved = registeredWorker()
+            guard let app = try poll(2, {
+                var candidates = NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle)
+                    .filter { !$0.isTerminated }
+                if let recorded = saved?.application,
+                   !candidates.contains(where: { $0.processIdentifier == recorded.processIdentifier }) {
+                    candidates.append(recorded)
+                }
+                guard candidates.count <= 1 else {
+                    throw BridgeError("multiple_app_instances", "The read-only monitor could not uniquely identify the Gemini App. No window was changed.")
+                }
+                if candidates.isEmpty {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.04))
+                }
+                return candidates.first
+            }) else {
+                throw BridgeError("app_not_observable", "No running Gemini App could be located for read-only monitoring. The last saved job state is still available through history-read.")
             }
-            try Self.deliver("googlegemini://newchat")
+            _ = try requireResponsiveUI(app.processIdentifier)
+            running = app
+        } else {
+            if NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).isEmpty {
+                guard !self.noNavigation else {
+                    throw BridgeError("would_navigate", "Open the intended Gemini Task before using no-navigation mode.")
+                }
+                try Self.deliver("googlegemini://newchat")
+            }
+            guard let app = try poll(12, { NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).min {
+                ($0.launchDate ?? .distantFuture) < ($1.launchDate ?? .distantFuture)
+            } }) else {
+                throw BridgeError("app_unavailable", "The Gemini Mac app did not start.")
+            }
+            running = app
         }
-        guard let app = try poll(12, { NSRunningApplication.runningApplications(withBundleIdentifier: geminiBundle).min {
-            ($0.launchDate ?? .distantFuture) < ($1.launchDate ?? .distantFuture)
-        } }) else {
-            throw BridgeError("app_unavailable", "The Gemini Mac app did not start.")
-        }
-        running = app
-        if readOnly { _ = try requireResponsiveUI(app.processIdentifier) }
-        accessibility = AXUIElementCreateApplication(app.processIdentifier)
+        accessibility = AXUIElementCreateApplication(running.processIdentifier)
         AXUIElementSetMessagingTimeout(accessibility, 1.8)
     }
 
@@ -1834,6 +1858,7 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
         }
         if !app.showsConversation(job.marker, nativeID: job.conversationID) {
             if noNavigation || app.readOnly {
+                job.state = "status_unconfirmed"
                 job.progress = "The selected Task differs from this job; no-navigation mode left the window unchanged."
                 return job
             }
@@ -1867,9 +1892,18 @@ func status(_ id: String, store: Store, noNavigation: Bool = false, requireWorke
 func waitForJob(_ job: Job, timeout: TimeInterval, store: Store, noNavigation: Bool = false) throws -> Job {
     let deadline = ProcessInfo.processInfo.systemUptime + timeout
     var latest = job
+    var observationFailure: BridgeError?
+    var observationFailureSince: TimeInterval?
     while !latest.isTerminal, latest.state != "needs_input" {
         do {
             latest = try status(job.jobID, store: store, noNavigation: noNavigation)
+            observationFailure = nil
+            observationFailureSince = nil
+        } catch let error as BridgeError where error.code == "app_not_observable" {
+            let now = ProcessInfo.processInfo.systemUptime
+            observationFailure = error
+            if observationFailureSince == nil { observationFailureSince = now }
+            if now - (observationFailureSince ?? now) >= 5 { break }
         } catch let error as BridgeError where error.code == "bridge_busy" {
             // Another invocation is making a short, serialized UI transition.
         }
@@ -1879,6 +1913,10 @@ func waitForJob(_ job: Job, timeout: TimeInterval, store: Store, noNavigation: B
             break
         }
         Thread.sleep(forTimeInterval: 0.9)
+    }
+    if let observationFailure {
+        latest.state = "status_unconfirmed"
+        latest.progress = observationFailure.message
     }
     if ["completed", "missing_output"].contains(latest.state), latest.conversationID == nil {
         let grace = min(4, max(0, deadline - ProcessInfo.processInfo.systemUptime))
